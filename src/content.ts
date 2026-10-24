@@ -70,7 +70,12 @@ let currentShortId = null;
 let previousMetaData = { creatorName: null, viewCount: "" };
 let currentVideoElement = null;
 let applicationIsOn = false;
-let scrollTimeout: any;
+let bindingGeneration = 0;
+let bindingShort = null;
+let pendingScroll = null;
+let pipTransferPending = false;
+let pipTransferWarningShown = false;
+let pipTransferFailedVideo = null;
 
 const MAX_RETRIES = 15;
 const RETRY_DELAY_MS = 500;
@@ -90,9 +95,11 @@ function startAutoScrolling() {
 
 function stopAutoScrolling() {
   applicationIsOn = false;
+  bindingGeneration++;
+  bindingShort = null;
+  pendingScroll = null;
   amountOfPlays = 0;
   if (currentVideoElement) {
-    // Adds back the loop attribute to the video element
     currentVideoElement.setAttribute("loop", "true");
     currentVideoElement.removeEventListener("ended", shortEnded);
     currentVideoElement._hasEndEvent = false;
@@ -103,228 +110,170 @@ async function checkForNewShort() {
   if (!applicationIsOn || !isShortsPage()) return;
   const currentShort = findShortContainer();
   if (!currentShort) return;
-
-  // Checks if the current short is the same as the last one
-  if (currentShort?.id != currentShortId) {
-    // Prevent scrolling from previous short ending
-    if (scrollTimeout) clearTimeout(scrollTimeout);
-
-    // Remove event listener from the previous video element
-    const previousShort = currentVideoElement;
-    if (previousShort) {
-      previousShort.removeEventListener("ended", shortEnded);
-      previousShort._hasEndEvent = false;
+  const video = currentShort.querySelector("video");
+  if (bindingShort === currentShort) return;
+  if (currentShort.id != currentShortId || video !== currentVideoElement) {
+    const generation = ++bindingGeneration;
+    bindingShort = currentShort;
+    pendingScroll = null;
+    if (currentVideoElement) {
+      currentVideoElement.removeEventListener("ended", shortEnded);
+      currentVideoElement._hasEndEvent = false;
     }
-
-    // Set the new current short id and video element
+    if (currentShort.id != currentShortId) amountOfPlays = 0;
     currentShortId = parseInt(currentShort.id);
-    currentVideoElement = currentShort.querySelector("video");
-
-    // Looping check if the current short has a video element
-    currentVideoElement = await waitForVideoElement(
-      currentShort,
-      currentShortId
-    );
-
-    if (!currentVideoElement) {
-      // If the video element is not found, scroll to the next short
-      let prevShortId = currentShortId;
-      currentShortId = null;
-      console.log(
-        "[Auto Youtube Shorts Scroller] Video element not found, scrolling to next short..."
-      );
-      return scrollToNextShort(prevShortId);
-    }
-
-    // Log the current short id
-    console.log(
-      "[Auto Youtube Shorts Scroller] Current ID of Short: ",
-      currentShortId
-    );
-
-    // Add event listener to the current video element
-
-    console.log(
-      "[Auto Youtube Shorts Scroller] Adding event listener to video element...",
-      currentVideoElement
-    );
-
-    currentVideoElement.addEventListener("ended", shortEnded);
-    currentVideoElement._hasEndEvent = true;
-
-    // Check if the current short has metadata, with check to see if metadata shows it's an ad.
-    const metaDataInformation = await waitForAllMetadata(currentShort);
-    if (metaDataInformation.isAd) {
-      console.log(
-        "[Auto Youtube Shorts Scroller] Ad detected, scrolling to next short..."
-      );
-      return scrollToNextShort(currentShortId, false);
-    }
-
-    const isValidShort = await checkShortValidity(currentShort);
-    if (metaDataInformation.metaDataLoaded && !isValidShort) {
-      console.log(
-        "[Auto Youtube Shorts Scroller] Short doesn't meet the filter settings, scrolling to next short..."
-      );
-      return scrollToNextShort(currentShortId, true);
-    }
-
-    // if paused for some reason, try and play the video
-    if (currentVideoElement.paused && applicationIsOn) {
-      try {
-        await currentVideoElement.play();
-      } catch {}
+    currentVideoElement = null;
+    try {
+      const nextVideo = await waitForVideoElement(currentShort, currentShortId);
+      if (!applicationIsOn || generation !== bindingGeneration) return;
+      currentVideoElement = nextVideo;
+      if (!nextVideo) {
+        // A reload would close PiP. Leave recovery to the next DOM update.
+        currentShortId = null;
+        return;
+      }
+      nextVideo.removeAttribute("loop");
+      nextVideo.addEventListener("ended", shortEnded);
+      nextVideo._hasEndEvent = true;
+      bindingShort = null;
+      syncPictureInPicture(nextVideo);
+      // YouTube may pause a newly selected Short while its tab is hidden.
+      if (nextVideo.paused && applicationIsOn) {
+        try { await nextVideo.play(); } catch {}
+      }
+      const metaDataInformation = await waitForAllMetadata(currentShort);
+      if (!applicationIsOn || generation !== bindingGeneration) return;
+      if (metaDataInformation.isAd) return scrollToNextShort(currentShortId, false);
+      const isValidShort = await checkShortValidity(currentShort);
+      if (!applicationIsOn || generation !== bindingGeneration) return;
+      if (metaDataInformation.metaDataLoaded && !isValidShort) {
+        return scrollToNextShort(currentShortId, true);
+      }
+    } finally {
+      if (generation === bindingGeneration) bindingShort = null;
     }
   }
-
-  // Force removal of the loop attribute if it exists
-  if (currentVideoElement?.hasAttribute("loop") && applicationIsOn) {
+  if (currentVideoElement && applicationIsOn) {
     currentVideoElement.removeAttribute("loop");
+    syncPictureInPicture(currentVideoElement);
   }
 }
 
-function shortEnded(e: Event) {
+function shortEnded(e) {
   e.preventDefault();
-  if (!applicationIsOn) return stopAutoScrolling();
-  console.log(
-    "[Auto Youtube Shorts Scroller] Short ended, scrolling to next short..."
-  );
+  if (!applicationIsOn || e.currentTarget !== currentVideoElement || pendingScroll) return;
   amountOfPlays++;
-
-  // Checks amount of plays to skip the short
   if (amountOfPlays >= amountOfPlaysToSkip) {
-    // If its same or exceeded the amount of plays, scroll to the next short
     amountOfPlays = 0;
     scrollToNextShort(currentShortId);
   } else {
-    // Otherwise, play the video again
-    currentVideoElement.play();
+    currentVideoElement.play().catch(() => {});
   }
 }
 
-async function scrollToNextShort(
-  prevShortId: number = null,
-  useDelayAndCheckComments = true
-) {
-  if (!applicationIsOn) return stopAutoScrolling();
-
-  const comments = document.querySelector(COMMENTS_SELECTORS[0]);
-  const commentSecondarySelector = document.querySelector(
-    COMMENTS_SELECTORS[1]
-  );
-  const isCommentsOpen = () => {
-    const visibilityAttr1OfComments = comments?.attributes["VISIBILITY"]?.value;
-    const hasPanelContentVisible =
-      comments
-        ?.querySelector("[panel-target-id='engagement-panel-comments-section']")
-        ?.hasAttribute("panel-content-visible") === true;
-
-    const isInView =
-      commentSecondarySelector &&
-      (() => {
-        const rect = commentSecondarySelector.getBoundingClientRect();
-        return rect.top < window.innerHeight && rect.bottom > 0;
-      })();
-
-    logCommentsVisibility(
-      visibilityAttr1OfComments,
-      isInView,
-      hasPanelContentVisible
-    );
-
-    return (
-      visibilityAttr1OfComments === "ENGAGEMENT_PANEL_VISIBILITY_EXPANDED" ||
-      isInView === true ||
-      hasPanelContentVisible
-    );
-  };
-
-  // Check if comments is open, and settings are set to scroll on comments
-  if (comments && useDelayAndCheckComments) {
-    if (isCommentsOpen() && !scrollOnCommentsCheck) {
-      useDelayAndCheckComments = false; // If the comments are open, don't wait for the additional scroll delay when scrolling
-      // If the comments are open, wait till they are closed (if the setting is set to scroll on comments)
-      while (
-        isCommentsOpen() && // Waits till the comments are closed
-        !scrollOnCommentsCheck && // Stops if the setting is changed
-        prevShortId == currentShortId // Stops if the short changes
-      ) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+async function scrollToNextShort(prevShortId = null, useDelayAndCheckComments = true) {
+  if (!applicationIsOn || !isShortsPage() || pendingScroll) return;
+  const request = {};
+  const generation = bindingGeneration;
+  pendingScroll = request;
+  const isCurrent = () => applicationIsOn && isShortsPage() &&
+    pendingScroll === request && generation === bindingGeneration &&
+    (prevShortId == null || prevShortId == currentShortId);
+  try {
+    const comments = document.querySelector(COMMENTS_SELECTORS[0]);
+    const isCommentsOpen = () => {
+      const title = document.querySelector(COMMENTS_SELECTORS[1]);
+      const rect = title?.getBoundingClientRect();
+      return comments?.getAttribute("visibility") === "ENGAGEMENT_PANEL_VISIBILITY_EXPANDED" ||
+        !!comments?.querySelector("[panel-target-id='engagement-panel-comments-section'][panel-content-visible]") ||
+        !!(rect && rect.top < window.innerHeight && rect.bottom > 0);
+    };
+    if (useDelayAndCheckComments && !scrollOnCommentsCheck && isCommentsOpen()) {
+      useDelayAndCheckComments = false;
+      while (isCurrent() && !scrollOnCommentsCheck && isCommentsOpen()) {
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
     }
-  }
+    if (!isCurrent()) return;
+    if (useDelayAndCheckComments && additionalScrollDelay > 0) {
+      currentVideoElement?.play().catch(() => {});
+      await new Promise(resolve => setTimeout(resolve, additionalScrollDelay));
+    } else {
+      // Defer until the ended event has finished dispatching.
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    if (!isCurrent()) return;
 
-  if (scrollTimeout) clearTimeout(scrollTimeout);
-  if (additionalScrollDelay > 0 && useDelayAndCheckComments)
-    // If the additional scroll delay is set, wait for it, and allow loop while delaying
-    currentVideoElement.play();
-  scrollTimeout = setTimeout(
-    async () => {
-      if (prevShortId != null && currentShortId != prevShortId) return; // If the short changed, don't scroll
-
-      const nextShortContainer = await waitForNextShort();
-      if (nextShortContainer == null && isShortsPage())
-        return window.location.reload(); // If no next short is found, reload the page (Last resort)
-
-      // If next short container is found, remove the current video element end event listener
-      if (currentVideoElement) {
-        currentVideoElement.removeEventListener("ended", shortEnded);
-        currentVideoElement._hasEndEvent = false;
+    if (document.pictureInPictureElement) {
+      // Direct navigation works without a smooth-scroll animation in a hidden tab.
+      const button = document.querySelector(
+        scrollDirection === 1 ? NEXT_BUTTON_SELECTOR : PREVIOUS_BUTTON_SELECTOR
+      ) as HTMLButtonElement;
+      if (button && !button.disabled && button.getAttribute("aria-disabled") !== "true") {
+        button.click();
+        checkForNewShort();
+        return;
       }
+    }
 
-      // Scroll to the next short container
-      nextShortContainer.scrollIntoView({
-        behavior: "smooth",
-        block: "nearest",
-        inline: "start",
-      });
-      // Then check the new short
-      checkForNewShort();
-    },
-    // Sets the additional scroll delay from settings
-    useDelayAndCheckComments ? additionalScrollDelay : 0
-  );
+    const nextShort = await waitForNextShort();
+    if (!isCurrent()) return;
+    if (!nextShort) {
+      if (!document.pictureInPictureElement) window.location.reload();
+      return;
+    }
+    nextShort.scrollIntoView({
+      behavior: document.pictureInPictureElement ? "instant" : "smooth",
+      block: "nearest",
+      inline: "start",
+    });
+    checkForNewShort();
+  } finally {
+    if (pendingScroll === request) pendingScroll = null;
+  }
+}
+
+// Transfer only while a PiP session exists. Closing PiP must never reopen it.
+async function syncPictureInPicture(video = currentVideoElement) {
+  const pipVideo = document.pictureInPictureElement;
+  if (!applicationIsOn || !isShortsPage() || !video || !pipVideo ||
+      pipVideo === video || pipTransferPending || pipTransferFailedVideo === video || video.readyState < 2 ||
+      typeof video.requestPictureInPicture !== "function") return;
+  pipTransferPending = true;
+  try {
+    await video.requestPictureInPicture();
+  } catch (error) {
+    pipTransferFailedVideo = video;
+    if (!pipTransferWarningShown) {
+      pipTransferWarningShown = true;
+      console.info("[Auto Youtube Shorts Scroller] Chrome could not transfer PiP. Reopen PiP on the current Short.", error);
+    }
+  } finally {
+    pipTransferPending = false;
+  }
 }
 
 function findShortContainer(id = null) {
-  let shorts = [] as HTMLDivElement[];
-
-  // Finds the short container by the selector (Incase of updates)
-  for (let i = 0; i < VIDEOS_LIST_SELECTORS.length; i++) {
-    const shortList = [
-      ...document.querySelectorAll(VIDEOS_LIST_SELECTORS[i]),
-    ] as HTMLDivElement[];
-    if (shortList.length > 0) {
-      shorts = [...shortList];
-      break;
-    }
+  let shorts = [];
+  for (const selector of VIDEOS_LIST_SELECTORS) {
+    shorts = [...document.querySelectorAll(selector)];
+    if (shorts.length) break;
   }
-
-  // If an id is provided, find the short with that id
+  // An explicit lookup must not fall back to the current or an unrelated Short.
   if (id != null) {
-    if (shorts.length === 0)
-      return document.getElementById(id) as HTMLDivElement; // Short container should always contain id of the short order.
-    const short = shorts.find((short) => short.id == id.toString());
-    if (short) return short as HTMLDivElement;
+    return shorts.find(short => short.id === String(id)) ||
+      document.getElementById(String(id));
   }
-  // If no shorts are found, return the first short with the id of 0
-  if (shorts.length === 0)
-    return document.getElementById(currentShortId || 0) as HTMLDivElement;
-  // If no id is provided, find the first short with the is-active attribute
-  // If id is provided, return short with id index from shorts list selector
-  const short =
-    id > 1
-      ? (shorts[id] as HTMLDivElement)
-      : ((shorts.find(
-          (short) =>
-            // Active short either has the is-active attribute or a hydrated HTML of short.
-            short.querySelector("#player") ||
-            short.hasAttribute("is-active") ||
-            short.querySelector(CURRENT_SHORT_SELECTOR) ||
-            short.querySelector("[is-active]")
-        ) ||
-          shorts[0]) /*If no short found, return first short */ as HTMLDivElement);
-  return short;
+  // Preloaded Shorts may also contain a player. Prefer YouTube's active marker.
+  const active = shorts.find(short =>
+    short.hasAttribute("is-active") || short.querySelector("[is-active]"));
+  if (active) return active;
+  const pipVideo = document.pictureInPictureElement;
+  const pipShort = pipVideo && shorts.find(short => short.contains(pipVideo));
+  if (pipShort) return pipShort;
+  return shorts.find(short => short.querySelector("#player") ||
+    short.querySelector(CURRENT_SHORT_SELECTOR)) || shorts[0] ||
+    document.getElementById(String(currentShortId || 0));
 }
 
 async function waitForNextShort(retries = 5, delay = 500) {
@@ -515,32 +464,14 @@ async function checkShortValidity(currentShort: HTMLDivElement) {
 
 function checkIfShortIsSponsered(currentShort: HTMLDivElement) {}
 
-async function waitForVideoElement(
-  currentShort: HTMLElement,
-  currentShortId: number
-): Promise<HTMLVideoElement | null> {
-  let tries = 0;
-  let video: HTMLVideoElement | null = currentShort.querySelector("video");
-
-  while (!video && currentShort.querySelector("ytd-reel-video-renderer")) {
-    if (tries > MAX_RETRIES) {
-      console.log(
-        "[Auto Youtube Shorts Scroller] Video element not found, scrolling to next short..."
-      );
-
-      const prevShortId = currentShortId;
-      currentShortId = null;
-
-      await scrollToNextShort(prevShortId);
-      return null;
-    }
-
-    await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-    video = currentShort.querySelector("video");
-    tries++;
+async function waitForVideoElement(currentShort, shortId) {
+  for (let tries = 0; tries <= MAX_RETRIES; tries++) {
+    if (!applicationIsOn || currentShortId !== shortId || !currentShort.isConnected) return null;
+    const video = currentShort.querySelector("video");
+    if (video) return video;
+    await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
   }
-
-  return video;
+  return null;
 }
 async function waitForAllMetadata(
   currentShort: HTMLElement
@@ -602,6 +533,17 @@ async function waitForAllMetadata(
   checkApplicationState();
 
   setInterval(checkForNewShort, RETRY_DELAY_MS);
+  // Media/DOM events continue to identify new videos without relying only on
+  // the polling timer, which Chrome can throttle when the tab is in the background.
+  const onVideoChange = () => { checkForNewShort(); };
+  document.addEventListener("loadeddata", onVideoChange, true);
+  document.addEventListener("play", onVideoChange, true);
+  document.addEventListener("enterpictureinpicture", onVideoChange, true);
+  document.addEventListener("visibilitychange", onVideoChange);
+  new MutationObserver(onVideoChange).observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ["is-active"],
+  });
+
 
   function checkApplicationState() {
     chrome.storage.local.get(["applicationIsOn"], (result) => {

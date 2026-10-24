@@ -28,6 +28,27 @@
 
 <img src="./images/ScreenshotGoogleExtensionYoutube1.png" width="500" height="400" />
 
+## Picture-in-picture playback (Chrome)
+
+With auto-scrolling enabled, open a Short in Chrome's native picture-in-picture
+mode (right-click the video twice, then select **Picture in picture**). Leave the
+YouTube tab open; you can switch to another tab or application.
+
+While PiP is open, the extension uses YouTube's next/previous button to advance
+without waiting for a smooth scroll in the background tab. Repeat counts,
+filters, comment-pause settings, and the additional scroll delay still apply.
+It also detects video replacements and attempts to transfer an existing PiP
+session to the new video.
+
+**Browser limitation:** If YouTube removes the old video and Chrome closes PiP,
+or Chrome rejects transferring PiP without a user gesture, reopen PiP on the
+current Short. The extension cannot guarantee uninterrupted PiP across every
+YouTube player replacement. Closing PiP yourself will not reopen it.
+
+To try this fork, load its `extension` folder as an unpacked extension using
+Option 2 above. The Chrome Web Store version linked above does not include this
+fork's changes. See [the PiP test checklist](./tests/PIP_TESTING.md).
+
 ## Firefox Add-On
 
 For Firefox, you can find a fork of this extension by [SoRadGaming](https://github.com/SoRadGaming). <br/>
